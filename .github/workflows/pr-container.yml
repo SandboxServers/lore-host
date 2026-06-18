@@ -1,0 +1,120 @@
+name: pr-container
+
+# Build the Lore server image on every PR that touches files going into
+# the image, and smoke-test the result locally — WITHOUT pushing to GHCR.
+# Catches Dockerfile / s6 / boot regressions before merge, so a broken
+# image never reaches the colo box.
+#
+# Path filter matches release-container.yml so a PR triggers this iff a
+# push of the same diff would warrant a release. (The Lore SOURCE is
+# cloned at a pinned tag inside the Dockerfile, so app-code changes don't
+# trigger here — only changes to how WE build/supervise/ship it.)
+#
+# Cache: shares the `type=gha` scope with the release workflow. The
+# expensive step is the Rust compile of loreserver; warm builds reuse it.
+# Cold first build is ~15-25 min (full Rust compile); warm a few minutes.
+
+on:
+  pull_request:
+    paths:
+      - 'docker/**'
+      - '.github/workflows/pr-container.yml'
+      - '.github/workflows/release-container.yml'
+  workflow_dispatch:
+
+# Deny everything top-level; each job opts into the minimum it needs.
+permissions: {}
+
+# Cancel superseded runs on the same PR (releases must NOT cancel; PRs should).
+concurrency:
+  group: pr-container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    name: build + smoke-test (no push)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # actions/checkout
+    # Cold cache + full Rust build of loreserver can run long; 40 catches a
+    # hung step without killing a legitimate cold build.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # We don't push from this workflow; drop the git token after
+          # checkout so no later step (or compromised dep) can read it.
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: build (load locally, do not push)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: lore-server:pr-${{ github.event.pull_request.number || 'dispatch' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Fail the PR on CRITICAL CVEs in the built image. HIGH and below
+      # are reported but don't block; Dependabot bumps the pinned base
+      # digests over time. .trivyignore (if present) accepts individual
+      # CVEs with a documented reason.
+      - name: scan with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: lore-server:pr-${{ github.event.pull_request.number || 'dispatch' }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+          trivyignores: .trivyignore
+
+      - name: smoke-test the locally-built image
+        env:
+          IMAGE: lore-server:pr-${{ github.event.pull_request.number || 'dispatch' }}
+        # NOT using --rm: if the container exits early we want its logs.
+        run: |
+          set -uo pipefail
+          docker run -d --name smoke \
+            -p 41337:41337/tcp \
+            -p 41337:41337/udp \
+            -p 41339:41339/tcp \
+            "$IMAGE"
+
+          # Readiness = Lore's own HTTP health endpoint returns 200.
+          # ~120 s budget for s6 init + loreserver bind. The container
+          # runs with the zero-config ephemeral cert here (no cert is
+          # mounted in CI), which is fine — we're testing that the image
+          # boots and serves, not the production TLS posture.
+          ok=0
+          for i in $(seq 1 60); do
+            if docker exec smoke curl --fail --silent http://127.0.0.1:41339/health_check >/dev/null 2>&1; then
+              echo "smoke ok at iteration $i"
+              ok=1
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Status}}' smoke 2>/dev/null)" = "exited" ]; then
+              echo "::error::container exited before becoming healthy"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "::group::container state"
+          docker inspect -f 'Status: {{.State.Status}}  ExitCode: {{.State.ExitCode}}  Error: {{.State.Error}}' smoke || true
+          echo "::endgroup::"
+          echo "::group::container logs"
+          docker logs smoke || true
+          echo "::endgroup::"
+
+          docker rm -f smoke >/dev/null 2>&1 || true
+
+          if [ "$ok" -ne 1 ]; then
+              echo "::error::smoke test never saw a healthy /health_check within 120s"
+              exit 1
+          fi

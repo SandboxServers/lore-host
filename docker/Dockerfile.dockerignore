@@ -1,0 +1,23 @@
+# Build context denylist. The Lore source is cloned at a pinned tag
+# INSIDE the builder stage, so the image needs almost nothing from this
+# repo's worktree — only the docker/ tree (s6 service + entrypoint) is
+# COPYed in. This keeps the context buildx ships to the daemon tiny and
+# guarantees nothing stray (secrets, certs, backups) can leak into a layer.
+
+# Everything by default…
+*
+
+# …except the docker/ inputs the Dockerfile actually COPYs.
+!docker/entrypoint.sh
+!docker/s6/**
+
+# Belt-and-suspenders: never let credentials or backups into the context
+# even if an `!` rule above gets loosened later.
+**/*.pem
+**/*.key
+**/*.crt
+**/secrets/**
+**/.env
+**/.env.*
+**/backups/**
+**/.git/**

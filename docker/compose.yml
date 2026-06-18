@@ -1,0 +1,110 @@
+# Lore VCS server — single-file colo deployment.
+#
+# The whole deployment unit is THIS FILE plus the named volume it
+# declares. To deploy on the colo box:
+#
+#   scp docker/compose.yml colo:/opt/lore/compose.yml
+#   ssh colo
+#   cd /opt/lore
+#   # (first time) generate/install the TLS cert — see docs/RUNBOOK.md § TLS
+#   docker compose pull        # pulls the PINNED tag, never :latest
+#   docker compose up -d
+#
+# Full deploy / rollback / restore / rotate procedures: docs/RUNBOOK.md.
+#
+# # Durability (this is the whole point)
+#
+#   - Lore's content store lives on the NAMED volume `lore-data`, mounted
+#     at /data. Named, not anonymous: a named volume survives `docker rm`,
+#     `docker compose down`, host reboots, and image bumps. This holds the
+#     team's entire VCS history.
+#   - `restart: unless-stopped` brings the server back after a host reboot
+#     or a crash, but not after an explicit operator `docker stop`.
+#   - The image tag is PINNED (see `image:` below). There is deliberately
+#     NO Watchtower / auto-update here — unlike the Cimmeria deployment —
+#     because Lore is pre-1.0 and an unattended pull could swap in a build
+#     whose on-disk format doesn't match the existing /data. Version bumps
+#     are manual and backup-first (RUNBOOK § Upgrade).
+
+services:
+  lore-server:
+    # PINNED tag — bump deliberately, never `:latest`, never auto-pull.
+    # Published by .github/workflows/release-container.yml. Replace the
+    # date tag below with the specific release you intend to run; the
+    # rolling `latest-prerelease` pointer exists for convenience but the
+    # colo should pin to an immutable dated tag so a re-deploy is
+    # reproducible. See RUNBOOK § Deploy for choosing the tag.
+    image: ghcr.io/sandboxservers/lore-server:latest-prerelease
+    container_name: lore-server
+    restart: unless-stopped
+
+    ports:
+      # 41337 carries BOTH gRPC (TCP) and QUIC (UDP) — Lore clients push
+      # to / clone from the QUIC endpoint. Both protocol mappings are
+      # required.
+      - "41337:41337/tcp"   # gRPC
+      - "41337:41337/udp"   # QUIC (push/clone)
+      # 41339 is the HTTP endpoint: health check + (if enabled) presigned
+      # URLs. Bind it to loopback on the colo if only the local reverse
+      # proxy / health tooling needs it — see the commented override.
+      - "41339:41339/tcp"   # HTTP (health)
+      # To restrict the HTTP port to the host only, use instead:
+      #   - "127.0.0.1:41339:41339/tcp"
+
+    environment:
+      RUST_LOG: "info"
+      # loreserver reads /etc/lore/config (baked default.toml + docker.toml
+      # pinning stores to /data) and applies LORE__-prefixed env last.
+      # Example (commented): force the store path even if a mounted config
+      # tried to move it.
+      # LORE__IMMUTABLE_STORE__LOCAL__PATH: "/data"
+      # LORE__MUTABLE_STORE__LOCAL__PATH: "/data"
+
+    volumes:
+      # THE durable store. Named volume — see header. Never make this
+      # anonymous and never point it at a path you'll forget.
+      - lore-data:/data
+
+      # TLS + operator overrides, mounted read-only at deploy time and
+      # NEVER baked into the image (layers are forever and shareable).
+      # Uncomment once the cert + local.toml exist on the colo host.
+      # `local.toml` should set [server.quic.certificate] cert_file/pkey_file
+      # to the mounted cert paths. See RUNBOOK § TLS and § Rotate.
+      # - /opt/lore/certs/cert.pem:/etc/lore/cert.pem:ro
+      # - /opt/lore/certs/key.pem:/etc/lore/key.pem:ro
+      # - /opt/lore/config/local.toml:/etc/lore/config/local.toml:ro
+
+    # Least privilege. Lore needs to bind ports and write /data; it does
+    # not need any Linux capabilities beyond the defaults — drop them all.
+    # no-new-privileges stops any in-container setuid escalation.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # Keep container logs bounded so a chatty RUST_LOG can't fill the colo
+    # disk (the failure this repo exists to prevent has a sibling: logs,
+    # not just data, filling the finite disk).
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    # Healthcheck is ALSO defined in the image (Dockerfile HEALTHCHECK);
+    # restating it here makes the contract visible in the deployment unit
+    # and lets the colo tune it without a rebuild.
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:41339/health_check"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+# Named volume holding the team's entire VCS history. Backed up nightly
+# and offsite — see docs/RUNBOOK.md § Backup strategy. Declared here (not
+# external) so `docker compose up` creates it on first run; once created,
+# `docker compose down` (without `-v`) leaves it intact.
+volumes:
+  lore-data:
+    name: lore-data

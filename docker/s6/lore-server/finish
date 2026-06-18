@@ -1,0 +1,9 @@
+#!/command/execlineb -S0
+# If loreserver exits for any reason, tear the whole supervision tree
+# down so the CONTAINER exits. With `restart: unless-stopped` in
+# compose.yml, Docker then restarts the container cleanly and the
+# restart is visible to the operator (and to monitoring) — rather than
+# s6 silently respawning a crash-looping process inside a container that
+# still looks "up". loreserver is the only service here, so a dead
+# loreserver means the container has no reason to live.
+s6-svscanctl -t /run/service

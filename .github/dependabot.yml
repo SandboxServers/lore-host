@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Keep the digest-pinned base images in docker/Dockerfile current.
+  # Digest pinning is the integrity guarantee (a tag is mutable); the
+  # cost is that without automation we'd ship known-CVE base layers
+  # forever. Dependabot opens a PR when rust:slim-trixie / debian:trixie-slim
+  # are rebuilt upstream, which pr-container.yml then builds + Trivy-scans.
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  # Keep the SHA-pinned GitHub Actions current (checkout, buildx,
+  # build-push, trivy, delete-package-versions).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
