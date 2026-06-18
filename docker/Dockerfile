@@ -51,11 +51,18 @@ ARG LORE_COMMIT
 
 # Native deps Lore's build needs:
 #   build-essential   — C/C++ toolchain for native crates.
-#   protobuf-compiler — Lore's gRPC/proto build (lore-proto) needs protoc.
+#   protobuf-compiler — `protoc` itself, for Lore's gRPC/proto build (lore-proto).
+#   libprotobuf-dev   — ships the well-known protobuf includes under
+#                       /usr/include/google/protobuf/*.proto (timestamp.proto,
+#                       etc.). lore-proto's .proto files `import` these; without
+#                       this package protoc fails with
+#                       "google/protobuf/timestamp.proto: File not found".
+#                       (protobuf-compiler alone does NOT carry the includes.)
 #   git, ca-certificates — to clone the pinned source over HTTPS.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         protobuf-compiler \
+        libprotobuf-dev \
         git \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*

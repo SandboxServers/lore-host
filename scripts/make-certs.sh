@@ -1,13 +1,23 @@
 #!/bin/sh
 # Generate a self-signed TLS certificate for the Lore QUIC/gRPC endpoint.
 #
-# This is a STOPGAP for getting a durable (non-ephemeral) cert in place
-# quickly. A self-signed cert means every Lore client must trust it
-# explicitly. For a real deployment, replace this with a cert from your
-# CA (Let's Encrypt via DNS-01, or the team's internal CA) — see
-# docs/RUNBOOK.md § Reverse proxy + TLS. The important durability win
-# either way is that the cert is STABLE across restarts (the zero-config
-# Lore cert is regenerated on every boot, which breaks pinned clients).
+# # OFFLINE / AIR-GAPPED FALLBACK ONLY.
+#
+# The PRODUCTION TLS path is now auto-renewing Let's Encrypt via the lego
+# DNS-01 sidecar (see docker/compose.yml `lego` service + docs/RUNBOOK.md
+# § Reverse proxy + TLS). Prefer that.
+#
+# Use THIS script only when LE is not an option:
+#   - air-gapped / no outbound internet to reach the ACME API,
+#   - the DNS provider has no API (so DNS-01 can't work) and :80 isn't
+#     publicly reachable (so HTTP-01 can't work either),
+#   - a quick local bring-up before the DNS token is provisioned.
+#
+# A self-signed cert means every Lore client must trust it explicitly, and
+# it does NOT auto-renew — you must re-run this and recreate the container
+# before the 825-day expiry. The durability win it shares with LE is that
+# the cert is STABLE across restarts (the zero-config Lore cert is
+# regenerated on every boot, which breaks pinned clients).
 #
 # Usage:
 #   scripts/make-certs.sh <CN> [outdir]

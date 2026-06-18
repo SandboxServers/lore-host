@@ -1,0 +1,32 @@
+# Lore server operator overrides — TLS certificate wiring.
+#
+# Copy to the colo as /opt/lore/config/local.toml and mount it read-only
+# into lore-server (see compose.yml). local.toml is the highest-priority
+# on-disk config layer (after it come only LORE__-prefixed env vars), so
+# these win over the image's baked default.toml / docker.toml.
+#
+# The cert/key paths point at what the lego sidecar writes onto the SHARED
+# `lore-certs` volume. lego's output filenames are <domain>.crt (leaf +
+# issuer chain) and <domain>.key. The lore-server container mounts that
+# volume read-only at /certs, so the files appear at:
+#
+#   /certs/certificates/<LORE_DOMAIN>.crt
+#   /certs/certificates/<LORE_DOMAIN>.key
+#
+# Replace <LORE_DOMAIN> below with the real domain (e.g.
+# lore.sandboxservers.games). These must match LORE_DOMAIN in .env.
+#
+# NOTE: Lore loads these at STARTUP ONLY (no hot-reload). After lego
+# renews, the sidecar's renew-hook restarts lore-server so it re-reads
+# them. See RUNBOOK § TLS.
+
+# Public QUIC endpoint (push/clone over UDP/41337) — clients pin this cert.
+[server.quic.certificate]
+cert_file = "/certs/certificates/<LORE_DOMAIN>.crt"
+pkey_file = "/certs/certificates/<LORE_DOMAIN>.key"
+
+# gRPC endpoint (HTTP/2 over TCP/41337) — serve the same LE cert so the
+# gRPC control path is TLS too, not just QUIC.
+[server.grpc.certificate]
+cert_file = "/certs/certificates/<LORE_DOMAIN>.crt"
+pkey_file = "/certs/certificates/<LORE_DOMAIN>.key"

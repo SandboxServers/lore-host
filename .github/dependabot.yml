@@ -11,6 +11,15 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 5
 
+  # The lego TLS sidecar's base image (goacme/lego) lives in its own
+  # subdirectory; the docker ecosystem scans a single directory's
+  # Dockerfile, so it needs its own entry to get digest bumps.
+  - package-ecosystem: "docker"
+    directory: "/docker/lego"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
   # Keep the SHA-pinned GitHub Actions current (checkout, buildx,
   # build-push, trivy, delete-package-versions).
   - package-ecosystem: "github-actions"

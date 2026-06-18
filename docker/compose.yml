@@ -1,99 +1,101 @@
-# Lore VCS server — single-file colo deployment.
+# Lore VCS server — single-file colo deployment, with auto-renewing
+# Let's Encrypt TLS via a DNS-01 lego sidecar.
 #
-# The whole deployment unit is THIS FILE plus the named volume it
-# declares. To deploy on the colo box:
+# The whole deployment unit is THIS FILE + an `.env` (from .env.example) +
+# the named volumes it declares + the DNS-token secret file. To deploy:
 #
 #   scp docker/compose.yml colo:/opt/lore/compose.yml
 #   ssh colo
 #   cd /opt/lore
-#   # (first time) generate/install the TLS cert — see docs/RUNBOOK.md § TLS
-#   docker compose pull        # pulls the PINNED tag, never :latest
+#   cp .env.example .env && $EDITOR .env          # fill in domain/email/provider
+#   # put the DNS-provider API token in /opt/lore/secrets/dns_api_token (0600)
+#   # put local.toml in /opt/lore/config/local.toml (from local.toml.example)
+#   docker compose pull
 #   docker compose up -d
 #
-# Full deploy / rollback / restore / rotate procedures: docs/RUNBOOK.md.
+# Full deploy / rollback / restore / rotate / TLS procedures: docs/RUNBOOK.md.
 #
 # # Durability (this is the whole point)
 #
-#   - Lore's content store lives on the NAMED volume `lore-data`, mounted
-#     at /data. Named, not anonymous: a named volume survives `docker rm`,
-#     `docker compose down`, host reboots, and image bumps. This holds the
-#     team's entire VCS history.
-#   - `restart: unless-stopped` brings the server back after a host reboot
-#     or a crash, but not after an explicit operator `docker stop`.
-#   - The image tag is PINNED (see `image:` below). There is deliberately
-#     NO Watchtower / auto-update here — unlike the Cimmeria deployment —
-#     because Lore is pre-1.0 and an unattended pull could swap in a build
-#     whose on-disk format doesn't match the existing /data. Version bumps
-#     are manual and backup-first (RUNBOOK § Upgrade).
+#   - Lore's content store lives on the NAMED volume `lore-data` (/data).
+#     Named, not anonymous: survives `docker rm`, `compose down`, reboots,
+#     and image bumps. This holds the team's entire VCS history.
+#   - The TLS cert lives on a second NAMED volume `lore-certs`, written by
+#     the lego sidecar and read (read-only) by lore-server. Named so the
+#     cert + ACME account survive restarts and reboots (re-issuing on every
+#     boot would burn Let's Encrypt rate limits).
+#   - `restart: unless-stopped` brings both back after a reboot or crash.
+#   - The lore-server image tag is PINNED via ${LORE_IMAGE} in .env. There
+#     is deliberately NO Watchtower / auto-update — Lore is pre-1.0 and an
+#     unattended pull could swap in a build whose on-disk format doesn't
+#     match the existing /data. Version bumps are manual + backup-first
+#     (RUNBOOK § Upgrade).
 
 services:
   lore-server:
-    # PINNED tag — bump deliberately, never `:latest`, never auto-pull.
-    # Published by .github/workflows/release-container.yml. Replace the
-    # date tag below with the specific release you intend to run; the
-    # rolling `latest-prerelease` pointer exists for convenience but the
-    # colo should pin to an immutable dated tag so a re-deploy is
-    # reproducible. See RUNBOOK § Deploy for choosing the tag.
-    image: ghcr.io/sandboxservers/lore-server:latest-prerelease
+    # PINNED tag via .env (LORE_IMAGE) — bump deliberately, never `:latest`,
+    # never auto-pull. The colo should pin an immutable dated tag
+    # (YYYY-MM-DD.N) so a re-deploy is reproducible. See RUNBOOK § Deploy.
+    image: ${LORE_IMAGE:-ghcr.io/sandboxservers/lore-server:latest-prerelease}
     container_name: lore-server
     restart: unless-stopped
 
+    # lego must have written the initial cert before lore-server can serve
+    # TLS. Lore would otherwise fall back to an ephemeral self-signed cert
+    # (regenerated each boot, breaking pinned clients). We don't hard-depend
+    # on the sidecar (Lore can boot without it), but order it after lego so
+    # a cold first-boot has the best chance of finding a cert. The sidecar's
+    # renew-hook restarts lore-server once the first cert lands regardless.
+    depends_on:
+      - lego
+
     ports:
-      # 41337 carries BOTH gRPC (TCP) and QUIC (UDP) — Lore clients push
-      # to / clone from the QUIC endpoint. Both protocol mappings are
-      # required.
+      # 41337 carries BOTH gRPC (TCP) and QUIC (UDP) — Lore clients push to
+      # / clone from the QUIC endpoint. Both protocol mappings are required.
       - "41337:41337/tcp"   # gRPC
       - "41337:41337/udp"   # QUIC (push/clone)
       # 41339 is the HTTP endpoint: health check + (if enabled) presigned
-      # URLs. Bind it to loopback on the colo if only the local reverse
-      # proxy / health tooling needs it — see the commented override.
-      - "41339:41339/tcp"   # HTTP (health)
-      # To restrict the HTTP port to the host only, use instead:
-      #   - "127.0.0.1:41339:41339/tcp"
+      # URLs. Bind to loopback unless something off-box needs it.
+      - "127.0.0.1:41339:41339/tcp"   # HTTP (health) — host-only by default
 
     environment:
       RUST_LOG: "info"
       # loreserver reads /etc/lore/config (baked default.toml + docker.toml
-      # pinning stores to /data) and applies LORE__-prefixed env last.
-      # Example (commented): force the store path even if a mounted config
-      # tried to move it.
+      # pinning stores to /data), then local.toml (TLS cert wiring), then
+      # LORE__-prefixed env last.
       # LORE__IMMUTABLE_STORE__LOCAL__PATH: "/data"
       # LORE__MUTABLE_STORE__LOCAL__PATH: "/data"
 
     volumes:
-      # THE durable store. Named volume — see header. Never make this
-      # anonymous and never point it at a path you'll forget.
+      # THE durable store. Named volume — see header. Never anonymous.
       - lore-data:/data
 
-      # TLS + operator overrides, mounted read-only at deploy time and
-      # NEVER baked into the image (layers are forever and shareable).
-      # Uncomment once the cert + local.toml exist on the colo host.
-      # `local.toml` should set [server.quic.certificate] cert_file/pkey_file
-      # to the mounted cert paths. See RUNBOOK § TLS and § Rotate.
-      # - /opt/lore/certs/cert.pem:/etc/lore/cert.pem:ro
-      # - /opt/lore/certs/key.pem:/etc/lore/key.pem:ro
-      # - /opt/lore/config/local.toml:/etc/lore/config/local.toml:ro
+      # TLS cert, written by the lego sidecar. Read-only here: lore-server
+      # only ever READS the cert; only lego writes it. Lore loads it at
+      # startup (no hot-reload) — the sidecar restarts this container on
+      # renewal so it re-reads the rotated cert.
+      - lore-certs:/certs:ro
 
-    # Least privilege. Lore needs to bind ports and write /data; it does
-    # not need any Linux capabilities beyond the defaults — drop them all.
-    # no-new-privileges stops any in-container setuid escalation.
+      # Operator config: local.toml points [server.quic.certificate] and
+      # [server.grpc.certificate] at /certs/certificates/<domain>.{crt,key}.
+      # Create it on the host from docker/config/local.toml.example.
+      - /opt/lore/config/local.toml:/etc/lore/config/local.toml:ro
+
+    # Least privilege.
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
 
-    # Keep container logs bounded so a chatty RUST_LOG can't fill the colo
-    # disk (the failure this repo exists to prevent has a sibling: logs,
-    # not just data, filling the finite disk).
+    # Bounded logs so a chatty RUST_LOG can't fill the colo disk.
     logging:
       driver: json-file
       options:
         max-size: "20m"
         max-file: "5"
 
-    # Healthcheck is ALSO defined in the image (Dockerfile HEALTHCHECK);
-    # restating it here makes the contract visible in the deployment unit
-    # and lets the colo tune it without a rebuild.
+    # Healthcheck is ALSO in the image; restating it makes the contract
+    # visible in the deployment unit and tunable without a rebuild.
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:41339/health_check"]
       interval: 30s
@@ -101,10 +103,81 @@ services:
       start_period: 30s
       retries: 3
 
-# Named volume holding the team's entire VCS history. Backed up nightly
-# and offsite — see docs/RUNBOOK.md § Backup strategy. Declared here (not
-# external) so `docker compose up` creates it on first run; once created,
-# `docker compose down` (without `-v`) leaves it intact.
+  # --- TLS: Let's Encrypt via DNS-01 (lego) --------------------------------
+  # Why a sidecar and not a reverse proxy: Lore terminates its OWN TLS on
+  # QUIC (UDP) + gRPC (HTTP/2 TCP); an L7 HTTP proxy can't terminate those.
+  # So lego just OBTAINS the cert and drops it where Lore reads it, then
+  # restarts Lore on renewal (Lore has no cert hot-reload). DNS-01 (not
+  # HTTP-01) because the colo is firewalled/VPN-only — no public inbound :80.
+  lego:
+    build:
+      context: ./lego
+      dockerfile: Dockerfile
+    # For colo deploy you can instead pull a published image; build-from-repo
+    # keeps the sidecar reproducible and Trivy-scannable in CI.
+    image: ${LEGO_IMAGE:-lore-lego:local}
+    container_name: lore-lego
+    restart: unless-stopped
+
+    environment:
+      LORE_DOMAIN: ${LORE_DOMAIN:?set LORE_DOMAIN in .env}
+      LE_EMAIL: ${LE_EMAIL:?set LE_EMAIL in .env}
+      LE_DNS_PROVIDER: ${LE_DNS_PROVIDER:-cloudflare}
+      LE_STAGING: ${LE_STAGING:-true}     # defaults to staging — see .env
+      LEGO_PATH: /certs
+      RENEW_INTERVAL_SECONDS: ${RENEW_INTERVAL_SECONDS:-86400}
+      RENEW_WITHIN_DAYS: ${RENEW_WITHIN_DAYS:-30}
+      LORE_CONTAINER_NAME: lore-server
+
+      # DNS-provider API token, supplied as a FILE (lego's *_FILE
+      # convention) so the secret never lands in an image layer or a
+      # compose env value. The VARIABLE NAME is provider-specific — this is
+      # the Cloudflare one; change it to match LE_DNS_PROVIDER (e.g.
+      # DO_AUTH_TOKEN_FILE for digitalocean). The file itself is the
+      # read-only mount below.
+      CLOUDFLARE_DNS_API_TOKEN_FILE: ${LE_DNS_TOKEN_FILE:-/run/secrets/dns_api_token}
+
+    volumes:
+      # Shared cert volume — lego WRITES here (read-write), lore-server
+      # reads it read-only.
+      - lore-certs:/certs
+
+      # The DNS-provider API token, bind-mounted READ-ONLY from the colo
+      # host. Keep this file 0600 and OUTSIDE the repo (it is gitignored).
+      # NOTE: a host bind mount is used (not a compose `secret`) so the path
+      # is obvious to a 2am operator; swap to docker secrets if preferred.
+      - /opt/lore/secrets/dns_api_token:/run/secrets/dns_api_token:ro
+
+      # Docker socket — REQUIRED so the renew-hook can `docker restart
+      # lore-server` to load a renewed cert (Lore has no hot-reload).
+      #
+      # *** SECURITY TRADEOFF ***: socket access is effectively root on the
+      # host. We accept it here for a small single-box colo because the
+      # alternative (host systemd timer running lego, no socket in any
+      # container) is more moving parts for a 2am operator. Mitigations:
+      # the sidecar drops all caps + no-new-privileges, only ever runs lego
+      # + one `docker restart`, and is not exposed to the network. If you
+      # want zero socket exposure, see RUNBOOK § TLS "no-socket alternative".
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Named volumes. `lore-data` holds the team's entire VCS history (backed up
+# nightly + offsite — RUNBOOK § Backup). `lore-certs` holds the LE cert +
+# the ACME account key (re-issuing every boot would burn LE rate limits).
+# Declared here (not external) so `compose up` creates them on first run;
+# `compose down` (without `-v`) leaves them intact.
 volumes:
   lore-data:
     name: lore-data
+  lore-certs:
+    name: lore-certs

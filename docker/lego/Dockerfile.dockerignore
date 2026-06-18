@@ -1,0 +1,6 @@
+# Build context for docker/lego/Dockerfile. Only the two scripts are
+# needed; deny everything else so no secret, cert, or stray file can be
+# copied into an image layer (layers are forever and shareable).
+*
+!entrypoint.sh
+!renew-hook.sh

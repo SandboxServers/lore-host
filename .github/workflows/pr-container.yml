@@ -118,3 +118,103 @@ jobs:
               echo "::error::smoke test never saw a healthy /health_check within 120s"
               exit 1
           fi
+
+  lego-sidecar:
+    name: build + smoke-test lego TLS sidecar (staging-only)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: build the lego sidecar image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: docker/lego
+          file: docker/lego/Dockerfile
+          push: false
+          load: true
+          tags: lore-lego:pr-${{ github.event.pull_request.number || 'dispatch' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: scan the sidecar with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: lore-lego:pr-${{ github.event.pull_request.number || 'dispatch' }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+          trivyignores: .trivyignore
+
+      - name: smoke-test the sidecar (STAGING ACME ONLY, no real credentials)
+        env:
+          IMAGE: lore-lego:pr-${{ github.event.pull_request.number || 'dispatch' }}
+        # We do NOT (and cannot) obtain a real cert here: there are no DNS
+        # credentials in CI. This proves the lego v5 CLI invocation parses
+        # and reaches the DNS-01 challenge step, which is exactly the class
+        # of bug (flag-ordering, hook env names) that broke during dev.
+        #
+        # CRITICAL GUARDRAIL: LE_STAGING defaults to true and we assert the
+        # PRODUCTION ACME endpoint is NEVER contacted, so a PR can never burn
+        # Let's Encrypt production rate limits.
+        run: |
+          set -uo pipefail
+          # Run a few fast iterations against the STAGING CA with a bogus
+          # provider config; expect a DNS-credential error, then stop.
+          docker run -d --name lego-smoke \
+            -e LORE_DOMAIN=lore.example.com \
+            -e LE_EMAIL=ci@example.com \
+            -e LE_DNS_PROVIDER=cloudflare \
+            -e LE_STAGING=true \
+            -e RENEW_INTERVAL_SECONDS=2 \
+            "$IMAGE"
+
+          parsed_ok=0
+          for i in $(seq 1 20); do
+            logs="$(docker logs lego-smoke 2>&1 || true)"
+            # Success criterion: lego got past flag parsing into the ACME/DNS
+            # setup. It will fail on missing Cloudflare creds — that string
+            # proves the CLI invocation is well-formed.
+            if echo "$logs" | grep -qiE 'credentials information are missing|DNS challenge provider'; then
+              echo "lego reached the DNS-01 challenge step (CLI invocation is valid)"
+              parsed_ok=1
+              break
+            fi
+            # A flag-parsing regression shows up as this instead:
+            if echo "$logs" | grep -qiE 'flag provided but not defined|Incorrect Usage'; then
+              echo "::error::lego CLI invocation is malformed (flag parsing failed)"
+              break
+            fi
+            sleep 2
+          done
+
+          all_logs="$(docker logs lego-smoke 2>&1 || true)"
+          echo "::group::lego sidecar logs"
+          echo "$all_logs"
+          echo "::endgroup::"
+
+          # Hard guardrail: the production ACME directory must never appear.
+          if echo "$all_logs" | grep -q 'acme-v02.api.letsencrypt.org'; then
+            echo "::error::sidecar contacted PRODUCTION Let's Encrypt in CI — must be staging only"
+            docker rm -f lego-smoke >/dev/null 2>&1 || true
+            exit 1
+          fi
+          # Positive confirmation it used staging.
+          if ! echo "$all_logs" | grep -qi 'STAGING'; then
+            echo "::warning::did not observe the staging banner; check LE_STAGING default"
+          fi
+
+          docker rm -f lego-smoke >/dev/null 2>&1 || true
+
+          if [ "$parsed_ok" -ne 1 ]; then
+            echo "::error::lego sidecar never reached the DNS-01 step — CLI likely broken"
+            exit 1
+          fi
