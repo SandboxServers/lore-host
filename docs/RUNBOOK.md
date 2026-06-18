@@ -26,11 +26,13 @@ All `docker compose` commands run from `/opt/lore` on the colo unless noted.
 4. [Backup strategy](#backup-strategy)
 5. [Restore from backup](#restore-from-backup)
 6. [Rotate (TLS cert / JWT signing keys)](#rotate)
-7. [Reverse proxy + TLS](#reverse-proxy--tls)
-8. [TLS renewal failed (troubleshooting)](#tls-renewal-failed)
-9. [Why a pinned tag (never `:latest`)](#why-a-pinned-tag)
-10. [Health, logs, capacity](#health-logs-capacity)
-11. [Open questions (colo specifics)](#open-questions-colo-specifics)
+7. [Provision Azure DNS for ACME](#provision-azure-dns-for-acme)
+8. [Set deploy-time secrets on the Debian colo box](#set-deploy-time-secrets-on-the-debian-colo-box)
+9. [Reverse proxy + TLS](#reverse-proxy--tls)
+10. [TLS renewal failed (troubleshooting)](#tls-renewal-failed)
+11. [Why a pinned tag (never `:latest`)](#why-a-pinned-tag)
+12. [Health, logs, capacity](#health-logs-capacity)
+13. [Open questions (colo specifics)](#open-questions-colo-specifics)
 
 ---
 
@@ -53,19 +55,22 @@ All `docker compose` commands run from `/opt/lore` on the colo unless noted.
    cp .env.example .env
    $EDITOR .env
    ```
-   Set at minimum: `LORE_DOMAIN` (e.g. `lore.sandboxservers.games`), `LE_EMAIL`,
-   `LE_DNS_PROVIDER` (the provider hosting the `sandboxservers.games` zone — see
-   [Open questions](#open-questions-colo-specifics)), and **leave `LE_STAGING=true` for the
-   first run** so a misconfig can't burn Let's Encrypt rate limits.
+   Set at minimum: `LORE_DOMAIN` (`lore.sandboxservers.games`), `LE_EMAIL`,
+   `LE_DNS_PROVIDER=azuredns` (the `sandboxservers.games` zone lives in **Azure DNS**), and
+   **leave `LE_STAGING=true` for the first run** so a misconfig can't burn Let's Encrypt rate
+   limits.
 
-3. **Drop in the DNS-provider API token** as a 0600 file (NOT in `.env`, NOT in git):
-   ```sh
-   install -m 600 /dev/stdin /opt/lore/secrets/dns_api_token    # then paste the token, Ctrl-D
-   ```
-   The compose `lego` service mounts this read-only and hands it to lego via the provider's
-   `*_FILE` env var (the Cloudflare default is `CLOUDFLARE_DNS_API_TOKEN_FILE`; if your
-   provider differs, change that var name in `compose.yml` — see `.env.example`). The token
-   should be **zone-scoped to `sandboxservers.games`, DNS-edit only** — least privilege.
+3. **Provision the Azure DNS service principal and drop its creds on the box.** Azure DNS
+   authenticates with **multiple** values (not a single token), so this is two steps:
+   - One-time, in Azure: create the app registration / service principal and grant it
+     **DNS Zone Contributor scoped to the `sandboxservers.games` zone** — see
+     [Provision Azure DNS for ACME](#provision-azure-dns-for-acme).
+   - On the box: write the `AZURE_*` values into a root-owned `chmod 600` env file that
+     compose loads via `env_file:` — see
+     [Set deploy-time secrets on the Debian colo box](#set-deploy-time-secrets-on-the-debian-colo-box).
+
+   Do **not** put any `AZURE_*` value (especially `AZURE_CLIENT_SECRET`) in `.env` or git —
+   this repo is public.
 
 4. **Create `/opt/lore/config/local.toml`** from the example, pointing Lore at the cert the
    lego sidecar writes (replace `<LORE_DOMAIN>` with your real domain):
@@ -293,6 +298,144 @@ engineer's.)
 
 ---
 
+## Provision Azure DNS for ACME
+
+The `lego` sidecar proves control of `lore.sandboxservers.games` by writing a temporary
+`_acme-challenge` **TXT** record into the `sandboxservers.games` zone in **Azure DNS**. It does
+that through an Azure AD **service principal** with **least-privilege** rights on *that one
+zone* — not the whole subscription.
+
+Do this **once** (or whenever you rotate the secret). You need an Azure account with rights to
+create an app registration and assign a role on the DNS zone. Commands use the `az` CLI; the
+portal works too.
+
+1. **Log in and select the subscription that holds the DNS zone.**
+   ```sh
+   az login
+   az account set --subscription "<SUBSCRIPTION_NAME_OR_ID>"
+   SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+   RESOURCE_GROUP="<rg-that-contains-the-dns-zone>"      # the RG holding the zone, NOT a new one
+   ZONE="sandboxservers.games"
+   ```
+
+2. **Confirm the zone exists and note its resource group.** (If the zone isn't in Azure DNS yet,
+   that's a prerequisite — create the zone and point the registrar's NS records at Azure first.)
+   ```sh
+   az network dns zone show -g "$RESOURCE_GROUP" -n "$ZONE" --query id -o tsv
+   # -> /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/dnszones/sandboxservers.games
+   ```
+
+3. **Create the app registration / service principal AND scope its role to the zone in one
+   shot.** `az ad sp create-for-rbac` with `--scopes` set to the **zone resource ID** grants
+   **DNS Zone Contributor on that zone only** — least privilege, not subscription-wide.
+   ```sh
+   ZONE_ID=$(az network dns zone show -g "$RESOURCE_GROUP" -n "$ZONE" --query id -o tsv)
+
+   az ad sp create-for-rbac \
+     --name "lore-acme-dns01" \
+     --role "DNS Zone Contributor" \
+     --scopes "$ZONE_ID"
+   ```
+   This prints JSON **once** — capture it now, the secret is not retrievable later:
+   ```json
+   {
+     "appId":    "00000000-0000-0000-0000-000000000000",   // -> AZURE_CLIENT_ID
+     "password": "the-generated-client-secret",            // -> AZURE_CLIENT_SECRET  (SECRET)
+     "tenant":   "00000000-0000-0000-0000-000000000000"     // -> AZURE_TENANT_ID
+   }
+   ```
+
+4. **Collect the five values lego needs** (source: lego upstream `azuredns` docs):
+
+   | lego env var | Value | Secret? |
+   | --- | --- | --- |
+   | `AZURE_TENANT_ID` | `tenant` from step 3 | no |
+   | `AZURE_CLIENT_ID` | `appId` from step 3 | no |
+   | `AZURE_CLIENT_SECRET` | `password` from step 3 | **YES** |
+   | `AZURE_SUBSCRIPTION_ID` | `$SUBSCRIPTION_ID` (step 1) | no |
+   | `AZURE_RESOURCE_GROUP` | `$RESOURCE_GROUP` (the zone's RG) | no |
+
+   We also set `AZURE_AUTH_METHOD=env` to pin lego to client-secret-from-env auth (skips the
+   Azure credential auto-detection chain — fail fast and explicit).
+
+5. **(Optional) verify the SP can edit the zone** before wiring it into lego:
+   ```sh
+   az role assignment list --assignee "<appId>" --scope "$ZONE_ID" -o table
+   # expect a "DNS Zone Contributor" row scoped to the zone
+   ```
+
+Now put these values on the box — next section.
+
+> **Least privilege, restated:** the role is scoped to the **zone resource ID**, so this
+> principal can edit records in `sandboxservers.games` and nothing else. If you ever see it
+> granted "Contributor" at subscription or RG scope, that's too broad — re-create it with
+> `--scopes "$ZONE_ID"`.
+
+---
+
+## Set deploy-time secrets on the Debian colo box
+
+The Azure service-principal creds live **only on the colo box**, in a root-owned `chmod 600`
+env file that `docker compose` loads via `env_file:`. They are never in git (public repo) and
+never baked into an image layer.
+
+1. **Create the secrets dir** (first deploy only):
+   ```sh
+   ssh COLO
+   sudo install -d -o root -g root -m 700 /opt/lore/secrets
+   ```
+
+2. **Write the env file** with the five values from
+   [Provision Azure DNS for ACME](#provision-azure-dns-for-acme). Create it root-owned and
+   `0600` from the start so the secret is never briefly world-readable:
+   ```sh
+   sudo install -o root -g root -m 600 /dev/null /opt/lore/secrets/azure-dns.env
+   sudo tee /opt/lore/secrets/azure-dns.env >/dev/null <<'EOF'
+   AZURE_AUTH_METHOD=env
+   AZURE_TENANT_ID=00000000-0000-0000-0000-000000000000
+   AZURE_CLIENT_ID=00000000-0000-0000-0000-000000000000
+   AZURE_CLIENT_SECRET=the-service-principal-secret
+   AZURE_SUBSCRIPTION_ID=00000000-0000-0000-0000-000000000000
+   AZURE_RESOURCE_GROUP=dns-rg-holding-the-sandboxservers-games-zone
+   EOF
+   ```
+   The variable names **must match `.env.example` exactly** — lego reads these literal
+   `AZURE_*` names. No quotes around values (an env file is `KEY=value`, not shell).
+
+3. **Lock down and verify permissions:**
+   ```sh
+   sudo chmod 600 /opt/lore/secrets/azure-dns.env
+   sudo chown root:root /opt/lore/secrets/azure-dns.env
+   ls -l /opt/lore/secrets/azure-dns.env      # expect: -rw------- root root
+   ```
+
+4. **How compose consumes it.** `compose.yml`'s `lego` service has:
+   ```yaml
+   env_file:
+     - ${AZURE_DNS_ENV_FILE:-/opt/lore/secrets/azure-dns.env}
+   ```
+   `.env` sets the path (`AZURE_DNS_ENV_FILE=/opt/lore/secrets/azure-dns.env`, the default). On
+   `docker compose up -d`, compose reads the env file and injects each `AZURE_*` var into the
+   sidecar's environment, where lego's `azuredns` provider reads them. **The file must exist or
+   `compose up` fails fast** — that's intentional (better than a sidecar that silently can't
+   issue a cert).
+
+5. **Rotating the secret later** (when the SP secret expires or is compromised): generate a new
+   secret in Azure (`az ad sp credential reset --id <appId>`), update
+   `/opt/lore/secrets/azure-dns.env`, then recreate just the sidecar so it picks up the new env:
+   ```sh
+   sudo $EDITOR /opt/lore/secrets/azure-dns.env     # paste the new AZURE_CLIENT_SECRET
+   docker compose up -d --force-recreate lego
+   docker compose logs --since 5m lego              # confirm it authenticates / renews cleanly
+   ```
+
+> **Higher-security variant.** If you'd rather keep `AZURE_CLIENT_SECRET` out of an env file
+> entirely, lego honors the `_FILE` suffix: set `AZURE_CLIENT_SECRET_FILE=/run/secrets/azure_client_secret`
+> (keep the non-secret IDs in the env file) and bind-mount that 0600 file read-only into the
+> sidecar. The shipped default is the single env file — fewer moving parts for a 2am operator.
+
+---
+
 ## Reverse proxy + TLS
 
 ### Why there is no reverse proxy terminating TLS
@@ -315,8 +458,12 @@ The `lego` service in `compose.yml` obtains and auto-renews a real Let's Encrypt
 
 - **DNS-01, not HTTP-01**, because the colo is firewalled / VPN-only — we can't assume public
   inbound :80. DNS-01 proves control by writing a TXT record through the DNS provider's API, so
-  it works entirely behind the firewall and also supports wildcards. Cost: it needs a
-  **DNS-provider API token** (the deploy-time secret in `/opt/lore/secrets/dns_api_token`).
+  it works entirely behind the firewall. Cost: it needs **DNS-provider credentials** — here, an
+  **Azure DNS service principal** scoped to the `sandboxservers.games` zone, stored in
+  `/opt/lore/secrets/azure-dns.env` (see [Provision Azure DNS for ACME](#provision-azure-dns-for-acme)).
+- **Single-host cert, no wildcard.** lego issues for `lore.sandboxservers.games` only
+  (`-d lore.sandboxservers.games`). DNS-01 *could* do a wildcard, but we deliberately don't —
+  a single-name cert keeps the blast radius minimal if the key is ever exposed.
 - lego writes `cert.pem`/`key.pem`-equivalents (`<domain>.crt` / `.key`) to the shared
   `lore-certs` volume; `local.toml` points Lore's `[server.quic.certificate]` and
   `[server.grpc.certificate]` at them.
@@ -377,8 +524,9 @@ docker compose logs --since 24h lego | grep -iE 'error|warning' | tail -n 20
 
 | Symptom in logs | Cause | Fix |
 | --- | --- | --- |
-| `credentials information are missing` | token file empty / wrong provider var | Check `/opt/lore/secrets/dns_api_token` is non-empty and 0600; confirm the `*_FILE` env var in `compose.yml` matches `LE_DNS_PROVIDER`. |
-| `unauthorized` / `403` from the DNS API | token lacks DNS-edit on the zone, or expired | Re-issue a zone-scoped, DNS-edit token at the provider; update the secret file; `docker compose up -d lego`. |
+| `credentials information are missing` / Azure credential build error | `azure-dns.env` missing, empty, or not loaded | Confirm `/opt/lore/secrets/azure-dns.env` exists, is `0600 root:root`, and has all five `AZURE_*` vars; confirm `.env`'s `AZURE_DNS_ENV_FILE` path matches; `docker compose up -d lego`. |
+| `unauthorized` / `403` / `AuthorizationFailed` from Azure | SP lacks DNS Zone Contributor on the zone, or `AZURE_CLIENT_SECRET` expired/wrong | Verify the role assignment is scoped to the zone (`az role assignment list --assignee <appId> --scope <zoneId>`); if the secret expired, reset it (`az ad sp credential reset --id <appId>`), update `azure-dns.env`, `docker compose up -d --force-recreate lego`. |
+| `tenant`/`client` ID error, `AADSTS700016` (app not found) | wrong `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` | Re-check the three IDs in `azure-dns.env` against the `az ad sp` output; recreate the SP if lost. |
 | `propagation` / `timeout` waiting for TXT | DNS propagation slow, or split-horizon DNS | Usually transient — let it retry. If persistent, set `LEGO_DNS_RESOLVERS` to the authoritative NS, or raise `--dns.propagation.wait`. |
 | `acme: error ... rateLimited` | hit production LE limits (too many real issuances) | Stop forcing issuance. Wait out the window. Use `LE_STAGING=true` for any experimentation. |
 | hook ran but clients still see old/ephemeral cert | `docker restart lore-server` failed (socket?) | Check `docker compose logs lego` for the renew-hook error; restart manually: `docker restart lore-server`; verify the socket mount. |
@@ -437,10 +585,11 @@ what we build.
 These need Steven's answers before this is production-final — see the PR description:
 - **Hostname / DNS** — `lore.sandboxservers.games` is the assumed name (set in `.env.example`).
   Confirm it's the intended FQDN and that an A/AAAA record points it at the box.
-- **DNS provider for `sandboxservers.games`** — **decides the `LE_DNS_PROVIDER` plugin and which
-  `*_FILE` token env var `compose.yml` must set.** `.env.example`/`compose.yml` default to
-  `cloudflare`; if the zone lives at Route 53 / Gandi / Namecheap / etc., update both. (This is
-  the single biggest blocker for TLS go-live.)
+- ~~**DNS provider for `sandboxservers.games`**~~ — RESOLVED: **Azure DNS** (`LE_DNS_PROVIDER=azuredns`).
+  Creds are an Azure service principal scoped to the zone, stored in `/opt/lore/secrets/azure-dns.env`
+  (see [Provision Azure DNS for ACME](#provision-azure-dns-for-acme)). Remaining sub-item: confirm
+  the `sandboxservers.games` zone is actually hosted in Azure DNS (registrar NS records point at
+  Azure) and note the zone's **subscription ID** and **resource group** for the env file.
 - **Exposed port + firewall / VPN** posture — Tailscale assumed? Public IP? Allowlist? This
   decides network exposure; DNS-01 works either way, so it does **not** block TLS issuance.
 - **Disk location for `lore-data` / `lore-certs`** on the box, and **headroom** vs. expected

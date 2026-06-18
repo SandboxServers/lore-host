@@ -15,8 +15,11 @@
 #
 # The colo is firewalled / VPN-only, so inbound :80 for HTTP-01 can't be
 # assumed. DNS-01 validates by creating a TXT record via the DNS
-# provider's API, so it works behind a firewall and supports wildcards.
-# It needs a DNS-provider API token (a deploy-time secret) — see .env.
+# provider's API, so it works behind a firewall. (DNS-01 also CAN do
+# wildcards, but this deployment issues a SINGLE-HOST cert for
+# ${LORE_DOMAIN} only — no wildcard — to keep the blast radius minimal.)
+# It needs DNS-provider API credentials (a deploy-time secret) — for
+# Azure DNS these are the AZURE_* service-principal vars; see .env.
 #
 # # Why it restarts lore-server on renewal
 #
@@ -38,7 +41,7 @@ set -eu
 # --- Required configuration (from compose env / .env) ---------------------
 : "${LORE_DOMAIN:?set LORE_DOMAIN, e.g. lore.sandboxservers.games}"
 : "${LE_EMAIL:?set LE_EMAIL — the ACME account contact address}"
-: "${LE_DNS_PROVIDER:?set LE_DNS_PROVIDER, e.g. cloudflare (see lego --dns)}"
+: "${LE_DNS_PROVIDER:?set LE_DNS_PROVIDER, e.g. azuredns (see lego --dns)}"
 
 # Output dir on the shared volume. lego writes:
 #   ${LEGO_PATH}/certificates/${LORE_DOMAIN}.crt   (leaf + issuer chain)
@@ -78,6 +81,8 @@ run_lego() {
         --server "${LE_SERVER}" \
         --dns "${LE_DNS_PROVIDER}" \
         --domains "${LORE_DOMAIN}" \
+        `# SINGLE-HOST cert: exactly one --domains (no wildcard ` \
+        `# *.sandboxservers.games). Add more only by adding more --domains.` \
         --path "${LEGO_PATH}" \
         --renew-days "${RENEW_WITHIN_DAYS}" \
         --deploy-hook "/usr/local/bin/renew-hook.sh"

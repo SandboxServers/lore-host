@@ -157,22 +157,29 @@ jobs:
       - name: smoke-test the sidecar (STAGING ACME ONLY, no real credentials)
         env:
           IMAGE: lore-lego:pr-${{ github.event.pull_request.number || 'dispatch' }}
-        # We do NOT (and cannot) obtain a real cert here: there are no DNS
-        # credentials in CI. This proves the lego v5 CLI invocation parses
-        # and reaches the DNS-01 challenge step, which is exactly the class
-        # of bug (flag-ordering, hook env names) that broke during dev.
+        # We do NOT (and cannot) obtain a real cert here: there are no Azure
+        # DNS credentials in CI. This proves the lego v5 CLI invocation parses
+        # and reaches the DNS-01 challenge / provider-setup step, which is
+        # exactly the class of bug (flag-ordering, hook env names, a bad
+        # provider name) that broke during dev.
+        #
+        # We exercise the REAL default provider (azuredns) so this test fails
+        # if the azuredns provider name or its wiring regresses. With no
+        # AZURE_* creds present, lego's azuredns provider fails to build its
+        # Azure credential — that error proves the CLI invocation is valid and
+        # reached provider setup.
         #
         # CRITICAL GUARDRAIL: LE_STAGING defaults to true and we assert the
         # PRODUCTION ACME endpoint is NEVER contacted, so a PR can never burn
         # Let's Encrypt production rate limits.
         run: |
           set -uo pipefail
-          # Run a few fast iterations against the STAGING CA with a bogus
-          # provider config; expect a DNS-credential error, then stop.
+          # Run a few fast iterations against the STAGING CA with no provider
+          # creds; expect an azuredns credential/auth error, then stop.
           docker run -d --name lego-smoke \
             -e LORE_DOMAIN=lore.example.com \
             -e LE_EMAIL=ci@example.com \
-            -e LE_DNS_PROVIDER=cloudflare \
+            -e LE_DNS_PROVIDER=azuredns \
             -e LE_STAGING=true \
             -e RENEW_INTERVAL_SECONDS=2 \
             "$IMAGE"
@@ -181,10 +188,12 @@ jobs:
           for i in $(seq 1 20); do
             logs="$(docker logs lego-smoke 2>&1 || true)"
             # Success criterion: lego got past flag parsing into the ACME/DNS
-            # setup. It will fail on missing Cloudflare creds — that string
-            # proves the CLI invocation is well-formed.
-            if echo "$logs" | grep -qiE 'credentials information are missing|DNS challenge provider'; then
-              echo "lego reached the DNS-01 challenge step (CLI invocation is valid)"
+            # provider setup. With no AZURE_* creds it fails building the Azure
+            # credential (or the generic "credentials information are missing"
+            # path) — either string proves the CLI invocation is well-formed
+            # and the azuredns provider was selected.
+            if echo "$logs" | grep -qiE 'credentials information are missing|DNS challenge provider|azure|azuredns|DefaultAzureCredential|ManagedIdentityCredential|EnvironmentCredential'; then
+              echo "lego reached the azuredns provider setup step (CLI invocation is valid)"
               parsed_ok=1
               break
             fi

@@ -8,7 +8,8 @@
 #   ssh colo
 #   cd /opt/lore
 #   cp .env.example .env && $EDITOR .env          # fill in domain/email/provider
-#   # put the DNS-provider API token in /opt/lore/secrets/dns_api_token (0600)
+#   # put the Azure DNS service-principal creds in
+#   #   /opt/lore/secrets/azure-dns.env (root:root, 0600) — see RUNBOOK
 #   # put local.toml in /opt/lore/config/local.toml (from local.toml.example)
 #   docker compose pull
 #   docker compose up -d
@@ -122,31 +123,30 @@ services:
     environment:
       LORE_DOMAIN: ${LORE_DOMAIN:?set LORE_DOMAIN in .env}
       LE_EMAIL: ${LE_EMAIL:?set LE_EMAIL in .env}
-      LE_DNS_PROVIDER: ${LE_DNS_PROVIDER:-cloudflare}
+      LE_DNS_PROVIDER: ${LE_DNS_PROVIDER:-azuredns}
       LE_STAGING: ${LE_STAGING:-true}     # defaults to staging — see .env
       LEGO_PATH: /certs
       RENEW_INTERVAL_SECONDS: ${RENEW_INTERVAL_SECONDS:-86400}
       RENEW_WITHIN_DAYS: ${RENEW_WITHIN_DAYS:-30}
       LORE_CONTAINER_NAME: lore-server
 
-      # DNS-provider API token, supplied as a FILE (lego's *_FILE
-      # convention) so the secret never lands in an image layer or a
-      # compose env value. The VARIABLE NAME is provider-specific — this is
-      # the Cloudflare one; change it to match LE_DNS_PROVIDER (e.g.
-      # DO_AUTH_TOKEN_FILE for digitalocean). The file itself is the
-      # read-only mount below.
-      CLOUDFLARE_DNS_API_TOKEN_FILE: ${LE_DNS_TOKEN_FILE:-/run/secrets/dns_api_token}
+    # Azure DNS service-principal credentials for lego's `azuredns` provider.
+    # Azure auth is MULTI-VARIABLE (not a single token), so they come from a
+    # root-owned chmod-600 env file on the colo host — NOT from this repo
+    # (public) and NOT baked into the image layer. compose reads it at
+    # `up` time and injects AZURE_AUTH_METHOD / AZURE_TENANT_ID /
+    # AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / AZURE_SUBSCRIPTION_ID /
+    # AZURE_RESOURCE_GROUP into the sidecar's env. See .env.example for the
+    # file template and RUNBOOK § "Set deploy-time secrets on the Debian colo
+    # box" for how to create it (and the higher-security AZURE_*_FILE variant).
+    # The file MUST exist on the host or `compose up` fails fast.
+    env_file:
+      - ${AZURE_DNS_ENV_FILE:-/opt/lore/secrets/azure-dns.env}
 
     volumes:
       # Shared cert volume — lego WRITES here (read-write), lore-server
       # reads it read-only.
       - lore-certs:/certs
-
-      # The DNS-provider API token, bind-mounted READ-ONLY from the colo
-      # host. Keep this file 0600 and OUTSIDE the repo (it is gitignored).
-      # NOTE: a host bind mount is used (not a compose `secret`) so the path
-      # is obvious to a 2am operator; swap to docker secrets if preferred.
-      - /opt/lore/secrets/dns_api_token:/run/secrets/dns_api_token:ro
 
       # Docker socket — REQUIRED so the renew-hook can `docker restart
       # lore-server` to load a renewed cert (Lore has no hot-reload).
