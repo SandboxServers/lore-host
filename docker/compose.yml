@@ -1,5 +1,21 @@
-# Lore VCS server — single-file colo deployment, with auto-renewing
+# Lore VCS server — single-file colo deployment, VPN-only, with auto-renewing
 # Let's Encrypt TLS via a DNS-01 lego sidecar.
+#
+# # Network posture: VPN-ONLY (no public exposure)
+#
+#   Lore is reachable ONLY over the operators' existing UniFi (UCG Fiber)
+#   WireGuard VPN. It is NEVER exposed to the public internet. Lore ships
+#   with auth DISABLED (gRPC accepts unauthenticated requests), so bare
+#   public ports would be an open door to the team's entire VCS history.
+#
+#   lore-server runs with `network_mode: host` and binds its QUIC/gRPC/HTTP
+#   endpoints to the host's PRIVATE LAN IP (${LORE_LAN_IP}) via local.toml —
+#   never 0.0.0.0, never the WAN. Host networking (not bridge + published
+#   ports) is deliberate: it lets Lore bind directly + truthfully to the one
+#   LAN interface, and avoids docker's bridge DNAT mangling the QUIC/UDP
+#   source path. The UCG Fiber must have NO WAN port-forward to 41337/41339;
+#   only the WireGuard server's UDP listen port is open on the WAN. See
+#   RUNBOOK § "Lore is reachable only over the UniFi (UCG Fiber) WireGuard VPN".
 #
 # The whole deployment unit is THIS FILE + an `.env` (from .env.example) +
 # the named volumes it declares + the DNS-token secret file. To deploy:
@@ -50,20 +66,33 @@ services:
     depends_on:
       - lego
 
-    ports:
-      # 41337 carries BOTH gRPC (TCP) and QUIC (UDP) — Lore clients push to
-      # / clone from the QUIC endpoint. Both protocol mappings are required.
-      - "41337:41337/tcp"   # gRPC
-      - "41337:41337/udp"   # QUIC (push/clone)
-      # 41339 is the HTTP endpoint: health check + (if enabled) presigned
-      # URLs. Bind to loopback unless something off-box needs it.
-      - "127.0.0.1:41339:41339/tcp"   # HTTP (health) — host-only by default
+    # VPN-only network posture. Host networking (not bridge + published
+    # ports) so Lore binds DIRECTLY to the private LAN IP set in local.toml:
+    #   - The bind is truthful: 41337/tcp (gRPC), 41337/udp (QUIC), and
+    #     41339/tcp (HTTP) listen on ${LORE_LAN_IP} ONLY — not 0.0.0.0, not
+    #     the WAN. They are reachable only from the colo LAN / over the UCG
+    #     Fiber WireGuard VPN. There is NO docker bridge DNAT in the QUIC/UDP
+    #     path (which can mangle UDP source addresses).
+    #   - There is therefore NO `ports:` block here: under host networking it
+    #     would be ignored. Exposure is controlled by the LAN bind in
+    #     local.toml + the UCG firewall (no WAN forward to these ports).
+    # Reverting to bridge + published ports would require publishing each port
+    # bound to ${LORE_LAN_IP} (e.g. "${LORE_LAN_IP}:41337:41337/udp") and
+    # having Lore bind 0.0.0.0 inside the container — host mode is simpler and
+    # correct for a single-purpose box with a QUIC/UDP data path.
+    network_mode: host
 
     environment:
       RUST_LOG: "info"
+      # The private LAN IP Lore binds to (used by the healthcheck below to
+      # probe the real bind address, since under host networking + LAN-only
+      # bind, 127.0.0.1:41339 does NOT answer). Real value comes from .env
+      # (LORE_LAN_IP); never committed. Fails fast if unset so a misdeploy
+      # can't bind somewhere unintended.
+      LORE_LAN_IP: ${LORE_LAN_IP:?set LORE_LAN_IP in .env (host private LAN IP)}
       # loreserver reads /etc/lore/config (baked default.toml + docker.toml
-      # pinning stores to /data), then local.toml (TLS cert wiring), then
-      # LORE__-prefixed env last.
+      # pinning stores to /data), then local.toml (LAN bind + TLS cert
+      # wiring), then LORE__-prefixed env last.
       # LORE__IMMUTABLE_STORE__LOCAL__PATH: "/data"
       # LORE__MUTABLE_STORE__LOCAL__PATH: "/data"
 
@@ -97,8 +126,11 @@ services:
 
     # Healthcheck is ALSO in the image; restating it makes the contract
     # visible in the deployment unit and tunable without a rebuild.
+    # Probes the REAL bind address (${LORE_LAN_IP}:41339), not loopback:
+    # under host networking with a LAN-only bind, 127.0.0.1 won't answer.
+    # Shell form so ${LORE_LAN_IP} expands from the container env.
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:41339/health_check"]
+      test: ["CMD-SHELL", "curl --fail --silent http://${LORE_LAN_IP}:41339/health_check || exit 1"]
       interval: 30s
       timeout: 10s
       start_period: 30s

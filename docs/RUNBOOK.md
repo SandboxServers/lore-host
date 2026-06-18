@@ -25,14 +25,15 @@ All `docker compose` commands run from `/opt/lore` on the colo unless noted.
 3. [Roll back](#roll-back)
 4. [Backup strategy](#backup-strategy)
 5. [Restore from backup](#restore-from-backup)
-6. [Rotate (TLS cert / JWT signing keys)](#rotate)
-7. [Provision Azure DNS for ACME](#provision-azure-dns-for-acme)
-8. [Set deploy-time secrets on the Debian colo box](#set-deploy-time-secrets-on-the-debian-colo-box)
-9. [Reverse proxy + TLS](#reverse-proxy--tls)
-10. [TLS renewal failed (troubleshooting)](#tls-renewal-failed)
-11. [Why a pinned tag (never `:latest`)](#why-a-pinned-tag)
-12. [Health, logs, capacity](#health-logs-capacity)
-13. [Open questions (colo specifics)](#open-questions-colo-specifics)
+6. [Lore is reachable only over the UniFi (UCG Fiber) WireGuard VPN](#vpn-only-network-posture)
+7. [Rotate (TLS cert / JWT signing keys)](#rotate)
+8. [Provision Azure DNS for ACME](#provision-azure-dns-for-acme)
+9. [Set deploy-time secrets on the Debian colo box](#set-deploy-time-secrets-on-the-debian-colo-box)
+10. [Reverse proxy + TLS](#reverse-proxy--tls)
+11. [TLS renewal failed (troubleshooting)](#tls-renewal-failed)
+12. [Why a pinned tag (never `:latest`)](#why-a-pinned-tag)
+13. [Health, logs, capacity](#health-logs-capacity)
+14. [Open questions (colo specifics)](#open-questions-colo-specifics)
 
 ---
 
@@ -55,7 +56,8 @@ All `docker compose` commands run from `/opt/lore` on the colo unless noted.
    cp .env.example .env
    $EDITOR .env
    ```
-   Set at minimum: `LORE_DOMAIN` (`lore.sandboxservers.games`), `LE_EMAIL`,
+   Set at minimum: `LORE_LAN_IP` (the host's **private LAN IP** — Lore binds here, VPN-only;
+   never `0.0.0.0`/WAN), `LORE_DOMAIN` (`lore.sandboxservers.games`), `LE_EMAIL`,
    `LE_DNS_PROVIDER=azuredns` (the `sandboxservers.games` zone lives in **Azure DNS**), and
    **leave `LE_STAGING=true` for the first run** so a misconfig can't burn Let's Encrypt rate
    limits.
@@ -72,13 +74,20 @@ All `docker compose` commands run from `/opt/lore` on the colo unless noted.
    Do **not** put any `AZURE_*` value (especially `AZURE_CLIENT_SECRET`) in `.env` or git —
    this repo is public.
 
-4. **Create `/opt/lore/config/local.toml`** from the example, pointing Lore at the cert the
-   lego sidecar writes (replace `<LORE_DOMAIN>` with your real domain):
+4. **Create `/opt/lore/config/local.toml`** from the example. This sets the **private LAN
+   bind addresses** (`<LORE_LAN_IP>`) for the QUIC/gRPC/HTTP endpoints **and** points Lore
+   at the cert the lego sidecar writes (`<LORE_DOMAIN>`). Substitute both from `.env`:
    ```sh
-   sed "s/<LORE_DOMAIN>/$(grep '^LORE_DOMAIN=' .env | cut -d= -f2)/" \
+   sed -e "s/<LORE_DOMAIN>/$(grep '^LORE_DOMAIN=' .env | cut -d= -f2)/g" \
+       -e "s/<LORE_LAN_IP>/$(grep '^LORE_LAN_IP=' .env | cut -d= -f2)/g" \
        config/local.toml.example > config/local.toml
-   cat config/local.toml      # sanity check the paths
+   cat config/local.toml      # sanity check: host = <your LAN IP> on quic/grpc/http; cert paths
    ```
+   `<LORE_LAN_IP>` is the host's **private LAN IP** (the address the box has on the colo LAN
+   behind the UCG Fiber). It must be a private/RFC1918 address — **never `0.0.0.0` and never
+   the WAN/public IP**. The same value goes in `.env` as `LORE_LAN_IP` (compose uses it for
+   the healthcheck). See
+   [Lore is reachable only over the UniFi WireGuard VPN](#vpn-only-network-posture).
 
 5. **Pin the image tag** in `.env`. Set `LORE_IMAGE` to the specific immutable dated tag you
    intend to run (not the rolling `latest-prerelease` pointer):
@@ -111,14 +120,19 @@ All `docker compose` commands run from `/opt/lore` on the colo unless noted.
    docker compose logs -f lego
    ```
 
-8. **Verify** (see [Health](#health-logs-capacity)):
+8. **Verify** (see [Health](#health-logs-capacity)). Lore binds the **private LAN IP**, not
+   loopback, so probe that address (run from the box, which is on the LAN, or from a device on
+   the VPN):
    ```sh
-   curl -i http://127.0.0.1:41339/health_check     # expect: HTTP/1.1 200 OK
+   LAN_IP=$(grep '^LORE_LAN_IP=' .env | cut -d= -f2)
+   curl -i "http://$LAN_IP:41339/health_check"      # expect: HTTP/1.1 200 OK
    docker compose ps                                # State should be "running (healthy)"
    # Confirm the served cert is the LE one (CN/issuer), not Lore's ephemeral self-signed:
-   echo | openssl s_client -connect 127.0.0.1:41337 -servername "$(grep '^LORE_DOMAIN=' .env | cut -d= -f2)" 2>/dev/null \
+   echo | openssl s_client -connect "$LAN_IP:41337" -servername "$(grep '^LORE_DOMAIN=' .env | cut -d= -f2)" 2>/dev/null \
      | openssl x509 -noout -issuer -subject -dates
    ```
+   Then confirm the ports are NOT reachable from the public internet — see
+   [VPN-only network posture § firewall verification](#firewall-verification).
 
 9. **Confirm the volumes are the named ones** (not accidental anonymous volumes):
    ```sh
@@ -177,7 +191,7 @@ If a new image is bad but `/data` is still intact and compatible:
 2. ```sh
    docker compose pull
    docker compose up -d
-   curl -i http://127.0.0.1:41339/health_check
+   curl -i "http://$(grep '^LORE_LAN_IP=' .env | cut -d= -f2):41339/health_check"
    ```
 
 If the bad version **migrated `/data` to an incompatible format**, an image rollback alone
@@ -254,7 +268,141 @@ If health is 200 and a clone works, the backup is **proven restorable**. Update 
    ```
    The script verifies the `.sha256`, prompts for `yes`, wipes `lore-data`, repopulates it
    from the archive, fixes ownership to UID/GID 1001, and restarts the server.
-3. Verify: `curl -i http://127.0.0.1:41339/health_check` (expect 200) and a client clone.
+3. Verify: `curl -i "http://$(grep '^LORE_LAN_IP=' .env | cut -d= -f2):41339/health_check"`
+   (expect 200) and a client clone over the VPN.
+
+---
+
+<a id="vpn-only-network-posture"></a>
+## Lore is reachable only over the UniFi (UCG Fiber) WireGuard VPN
+
+**The decision (settled):** Lore is **never exposed to the public internet.** It is reachable
+**only** over the operators' existing **UniFi WireGuard VPN**, which runs on the colo's
+**UCG Fiber** (UniFi Cloud Gateway Fiber) gateway. The Lore host sits on the colo LAN behind
+that gateway. This is the team's standing way in — no new VPN software, no extra moving parts.
+
+**Why VPN-only (not a public port + auth):** Lore ships with **authentication disabled** —
+the gRPC API accepts unauthenticated requests out of the box (`[server.auth]` absent in every
+shipped config). Bare public ports would be an open door to the team's *entire version-control
+history*. Gating at the network layer (VPN) is mandatory regardless of TLS; **TLS is encryption,
+not access control.**
+
+**How the bind enforces it (two layers, defense in depth):**
+
+1. **Lore binds the private LAN IP only.** `local.toml` sets `host = <LORE_LAN_IP>` on
+   `[server.quic]`, `[server.grpc]`, and `[server.http]` (the upstream
+   `lore-server-config` reference: each endpoint takes a `host` bind field defaulting to
+   `0.0.0.0`; we override it). So 41337/TCP (gRPC), 41337/UDP (QUIC), and 41339/TCP (HTTP
+   health) answer only on the colo LAN interface — never `0.0.0.0`, never the WAN.
+2. **`compose.yml` uses `network_mode: host`** so that bind is real and direct (no docker
+   bridge DNAT in the QUIC/UDP path). There is no `ports:` publish block — nothing is mapped
+   to a public interface.
+
+### How operators reach Lore
+
+1. **Connect the UniFi WireGuard VPN** on your laptop/device exactly as you already do to get
+   onto the colo network (the WireGuard app, using the config from the UCG Fiber). Once the
+   tunnel is up you are "on the LAN."
+2. **Hit `lore.sandboxservers.games`** with the `lore` client. Via split-horizon DNS (below)
+   that name resolves to the host's **private LAN IP**, which is reachable over the tunnel. The
+   Let's Encrypt cert's SAN is `lore.sandboxservers.games`, so TLS validates normally even
+   though the address behind the name is private.
+
+If you are **not** on the VPN, the name resolves to nothing useful and the ports do not answer
+from the public internet — that is the intended behavior.
+
+### Grant a new device access (add a WireGuard peer on the UCG Fiber)
+
+Each device that needs Lore gets its own WireGuard **client (peer)** on the UCG Fiber's
+built-in WireGuard VPN server. In the **UniFi Network** application:
+
+1. Go to **Settings → VPN → VPN Server** and open the **WireGuard** server (the one already
+   serving the operators). Note its **UDP listen port** (default **51820/UDP**) — that single
+   UDP port is the *only* thing the gateway exposes on the WAN for VPN.
+2. Click **Add Client** (i.e., add a peer).
+3. Give it a descriptive **name** (e.g. `steven-laptop`, `derek-desktop`).
+4. Let UniFi generate the client config (keypair + assigned tunnel IP). Optionally set a
+   pre-shared key and the allowed/remote networks. For Lore access the client's allowed IPs
+   must include the colo LAN subnet that holds `<LORE_LAN_IP>`.
+5. **Download the configuration file** (or scan the **QR code** on mobile) and import it into
+   the device's WireGuard app.
+6. Connect, then verify the device can reach Lore:
+   `curl -i https://lore.sandboxservers.games:41339/health_check` (expect `200`) once
+   split-horizon DNS resolves the name to `<LORE_LAN_IP>`.
+
+> Source for the UniFi steps: Ubiquiti Help Center, "UniFi Gateway – WireGuard VPN Server,"
+> and WunderTech's UCG WireGuard guide. The exact menu labels can shift between UniFi Network
+> versions — if **Settings → VPN → VPN Server** doesn't match your console, look under the
+> **VPN** section for the WireGuard **server** and its **Add Client** action.
+> **Flag:** confirm against the live console; UniFi relabels menus across releases.
+
+<a id="firewall-verification"></a>
+### Firewall verification — the public WAN must NOT forward Lore's ports
+
+The UCG Fiber must have **no WAN port-forward / NAT rule** sending 41337 or 41339 to the Lore
+host. The **only** inbound port open on the WAN should be the **WireGuard server's UDP listen
+port** (default 51820/UDP). Verify it:
+
+1. **In UniFi Network:** Settings → **Security / Port Forwarding** (a.k.a. NAT / firewall) —
+   confirm there is **no** forward for `41337` or `41339`. The only WAN-facing inbound service
+   should be the WireGuard VPN's UDP port.
+2. **From OFF the VPN** (e.g. a phone on cellular, or any host on the public internet),
+   confirm Lore's ports are **closed** against the colo's public/WAN IP. Replace
+   `<COLO_WAN_IP>` with the colo's real WAN address:
+   ```sh
+   # TCP gRPC (41337) and HTTP health (41339) — expect "closed"/filtered, NO connection:
+   nc -vz -w 5 <COLO_WAN_IP> 41337    # expect: timeout / refused, NOT "succeeded"
+   nc -vz -w 5 <COLO_WAN_IP> 41339    # expect: timeout / refused, NOT "succeeded"
+   # UDP QUIC (41337/udp) — should NOT respond on the WAN:
+   nc -vzu -w 5 <COLO_WAN_IP> 41337   # expect: no open/QUIC response
+   # If you have nmap:
+   nmap -Pn -p 41337,41339 <COLO_WAN_IP>          # expect: closed/filtered
+   nmap -Pn -sU -p 41337 <COLO_WAN_IP>            # expect: closed/filtered
+   ```
+   **Any of these succeeding from off-VPN is a red-alert misconfiguration** — Lore's
+   auth-disabled ports would be world-reachable. Remove the offending WAN forward immediately
+   and re-verify the LAN-only bind (`docker inspect lore-server`; confirm `host` in
+   `local.toml` is the LAN IP, and `network_mode: host` with no `ports:` block).
+3. **Confirm the bind on the box itself** — Lore should be listening on the LAN IP, not
+   `0.0.0.0`:
+   ```sh
+   ss -tulpn | grep -E '41337|41339'    # addresses should be <LORE_LAN_IP>:..., NOT 0.0.0.0:...
+   ```
+
+<a id="split-horizon-dns"></a>
+### Split-horizon DNS — `lore.sandboxservers.games` → private LAN IP for VPN clients
+
+VPN clients must resolve `lore.sandboxservers.games` to the host's **private LAN IP**
+(`<LORE_LAN_IP>`), while **public DNS** for `sandboxservers.games` carries **only** the
+`_acme-challenge` TXT record Let's Encrypt needs (there is deliberately **no public A/AAAA
+record** for the Lore name — nothing public should resolve it to a reachable address).
+
+For a **2-person team**, simplest first, in order of preference:
+
+- **Per-device hosts entry (simplest, zero infrastructure).** On each dev box, add one line:
+  ```
+  <LORE_LAN_IP>   lore.sandboxservers.games
+  ```
+  (`/etc/hosts` on Linux/macOS; `C:\Windows\System32\drivers\etc\hosts` on Windows.) Two
+  people, two files. Done. The cert SAN still matches the name, so TLS validates.
+- **UniFi DNS (cleaner, no per-device edits).** In **UniFi Network → Settings → Policy
+  Engine / DNS** (label varies by version), add a **local DNS record** mapping
+  `lore.sandboxservers.games → <LORE_LAN_IP>`. VPN clients that use the UCG Fiber as their
+  resolver then get the private answer automatically. Recommended once a third device shows up;
+  for two people the hosts entry is less to maintain.
+
+Either way, **do not publish a public A/AAAA record** for `lore.sandboxservers.games`. Public
+DNS for the zone holds only what ACME DNS-01 needs.
+
+### TLS (DNS-01) is unaffected by the VPN-only posture
+
+The lego sidecar proves domain control by writing a `_acme-challenge` **TXT** record to Azure
+DNS and talking **outbound** to Let's Encrypt — **no inbound `:80`/`:443` and no public
+exposure of Lore is required.** So DNS-01 issuance/renewal works exactly the same behind the
+VPN. The issued cert's SAN stays **`lore.sandboxservers.games`**, which VPN clients hit over the
+tunnel (resolving to the private LAN IP via split-horizon DNS) — the cert validates because the
+client connects to the SAN *name*, regardless of the private address behind it. See
+[Reverse proxy + TLS](#reverse-proxy--tls) for the full TLS design.
 
 ---
 
@@ -473,16 +621,22 @@ The `lego` service in `compose.yml` obtains and auto-renews a real Let's Encrypt
   certs, but no risk to the strict production rate limits. Flip to `false` on the box only once
   staging issuance works (first-time deploy step 7a).
 
-### Network exposure (still your job — TLS is not access control)
+### Network exposure — SETTLED: VPN-only via the UCG Fiber WireGuard VPN
 
-**Do not expose Lore's raw ports to the open internet.** Gate it at the network layer:
+**TLS is not access control.** The network gate is the
+[UniFi (UCG Fiber) WireGuard VPN](#vpn-only-network-posture) — that section is authoritative;
+this is the short version:
 
-- **Tailscale / WireGuard VPN** (recommended): only team devices on the tailnet reach 41337;
-  nothing is published publicly. Simplest and safest. DNS-01 still works because validation is
-  outbound to the DNS API, not inbound to the box.
-- **Firewall allowlist**: open 41337/tcp+udp (and 41339/tcp only if needed) to known team IPs.
-- Keep **41339 (HTTP health)** bound to loopback (`127.0.0.1:41339:...`, as shipped) or the VPN
-  — it's for health/presigned URLs, not the public.
+- Lore binds the **private LAN IP** (`<LORE_LAN_IP>`) on all three endpoints via `local.toml`,
+  with `network_mode: host` in compose. Nothing is published to a public interface.
+- The **UCG Fiber** exposes only the **WireGuard UDP listen port** (default 51820/UDP) on the
+  WAN — **no** WAN forward to 41337/41339. Verify with
+  [firewall verification](#firewall-verification).
+- DNS-01 still works because validation is **outbound** to Azure DNS, not inbound to the box.
+
+This deliberately does **not** use Tailscale (the operators run their own UniFi WireGuard and
+don't want a third-party control plane) and does not need a separate firewall-allowlist scheme —
+the VPN is the allowlist.
 
 ### The Docker-socket tradeoff, and the no-socket alternative
 
@@ -561,9 +715,11 @@ what we build.
 
 ## Health, logs, capacity
 
-- **Health:** `curl -i http://127.0.0.1:41339/health_check` → `200`. Container health:
-  `docker compose ps` (look for `healthy`). The image's `HEALTHCHECK` flips to `unhealthy`
-  after 3 failed probes.
+- **Health:** Lore binds the **private LAN IP**, so probe that (from the box or over the VPN),
+  not loopback:
+  `curl -i "http://$(grep '^LORE_LAN_IP=' /opt/lore/.env | cut -d= -f2):41339/health_check"` →
+  `200`. Container health: `docker compose ps` (look for `healthy`). The compose `HEALTHCHECK`
+  probes `${LORE_LAN_IP}:41339` and flips to `unhealthy` after 3 failed probes.
 - **Logs:** `docker compose logs -f lore-server` (JSON to stdout). Capped at 5×20 MB per
   `compose.yml` so logs can't fill the disk.
 - **Capacity (finite colo hardware — watch it):**
@@ -590,8 +746,14 @@ These need Steven's answers before this is production-final — see the PR descr
   (see [Provision Azure DNS for ACME](#provision-azure-dns-for-acme)). Remaining sub-item: confirm
   the `sandboxservers.games` zone is actually hosted in Azure DNS (registrar NS records point at
   Azure) and note the zone's **subscription ID** and **resource group** for the env file.
-- **Exposed port + firewall / VPN** posture — Tailscale assumed? Public IP? Allowlist? This
-  decides network exposure; DNS-01 works either way, so it does **not** block TLS issuance.
+- ~~**Exposed port + firewall / VPN** posture~~ — **RESOLVED: VPN-only via the UniFi
+  (UCG Fiber) WireGuard VPN.** Lore is never publicly exposed; it binds the private LAN IP
+  (`<LORE_LAN_IP>`) and is reached only over the operators' existing UCG Fiber WireGuard VPN.
+  See [Lore is reachable only over the UniFi WireGuard VPN](#vpn-only-network-posture). The UCG
+  must have no WAN forward to 41337/41339 (only the WireGuard UDP port) —
+  [verify](#firewall-verification). Remaining sub-item for the operator: set the real
+  `LORE_LAN_IP` in `.env` on the box, and pick split-horizon DNS (per-device hosts entry vs.
+  UniFi local DNS).
 - **Disk location for `lore-data` / `lore-certs`** on the box, and **headroom** vs. expected
   asset growth.
 - ~~**TLS cert source**~~ — RESOLVED: auto-renewing Let's Encrypt via DNS-01 (lego sidecar).
