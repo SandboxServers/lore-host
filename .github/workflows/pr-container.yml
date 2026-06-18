@@ -1,0 +1,229 @@
+name: pr-container
+
+# Build the Lore server image on every PR that touches files going into
+# the image, and smoke-test the result locally — WITHOUT pushing to GHCR.
+# Catches Dockerfile / s6 / boot regressions before merge, so a broken
+# image never reaches the colo box.
+#
+# Path filter matches release-container.yml so a PR triggers this iff a
+# push of the same diff would warrant a release. (The Lore SOURCE is
+# cloned at a pinned tag inside the Dockerfile, so app-code changes don't
+# trigger here — only changes to how WE build/supervise/ship it.)
+#
+# Cache: shares the `type=gha` scope with the release workflow. The
+# expensive step is the Rust compile of loreserver; warm builds reuse it.
+# Cold first build is ~15-25 min (full Rust compile); warm a few minutes.
+
+on:
+  pull_request:
+    paths:
+      - 'docker/**'
+      - '.github/workflows/pr-container.yml'
+      - '.github/workflows/release-container.yml'
+  workflow_dispatch:
+
+# Deny everything top-level; each job opts into the minimum it needs.
+permissions: {}
+
+# Cancel superseded runs on the same PR (releases must NOT cancel; PRs should).
+concurrency:
+  group: pr-container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    name: build + smoke-test (no push)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # actions/checkout
+    # Cold cache + full Rust build of loreserver can run long; 40 catches a
+    # hung step without killing a legitimate cold build.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # We don't push from this workflow; drop the git token after
+          # checkout so no later step (or compromised dep) can read it.
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: build (load locally, do not push)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: lore-server:pr-${{ github.event.pull_request.number || 'dispatch' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Fail the PR on CRITICAL CVEs in the built image. HIGH and below
+      # are reported but don't block; Dependabot bumps the pinned base
+      # digests over time. .trivyignore (if present) accepts individual
+      # CVEs with a documented reason.
+      - name: scan with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: lore-server:pr-${{ github.event.pull_request.number || 'dispatch' }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+          trivyignores: .trivyignore
+
+      - name: smoke-test the locally-built image
+        env:
+          IMAGE: lore-server:pr-${{ github.event.pull_request.number || 'dispatch' }}
+        # NOT using --rm: if the container exits early we want its logs.
+        run: |
+          set -uo pipefail
+          docker run -d --name smoke \
+            -p 41337:41337/tcp \
+            -p 41337:41337/udp \
+            -p 41339:41339/tcp \
+            "$IMAGE"
+
+          # Readiness = Lore's own HTTP health endpoint returns 200.
+          # ~120 s budget for s6 init + loreserver bind. The container
+          # runs with the zero-config ephemeral cert here (no cert is
+          # mounted in CI), which is fine — we're testing that the image
+          # boots and serves, not the production TLS posture.
+          ok=0
+          for i in $(seq 1 60); do
+            if docker exec smoke curl --fail --silent http://127.0.0.1:41339/health_check >/dev/null 2>&1; then
+              echo "smoke ok at iteration $i"
+              ok=1
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Status}}' smoke 2>/dev/null)" = "exited" ]; then
+              echo "::error::container exited before becoming healthy"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "::group::container state"
+          docker inspect -f 'Status: {{.State.Status}}  ExitCode: {{.State.ExitCode}}  Error: {{.State.Error}}' smoke || true
+          echo "::endgroup::"
+          echo "::group::container logs"
+          docker logs smoke || true
+          echo "::endgroup::"
+
+          docker rm -f smoke >/dev/null 2>&1 || true
+
+          if [ "$ok" -ne 1 ]; then
+              echo "::error::smoke test never saw a healthy /health_check within 120s"
+              exit 1
+          fi
+
+  lego-sidecar:
+    name: build + smoke-test lego TLS sidecar (staging-only)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: build the lego sidecar image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: docker/lego
+          file: docker/lego/Dockerfile
+          push: false
+          load: true
+          tags: lore-lego:pr-${{ github.event.pull_request.number || 'dispatch' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: scan the sidecar with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: lore-lego:pr-${{ github.event.pull_request.number || 'dispatch' }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+          trivyignores: .trivyignore
+
+      - name: smoke-test the sidecar (STAGING ACME ONLY, no real credentials)
+        env:
+          IMAGE: lore-lego:pr-${{ github.event.pull_request.number || 'dispatch' }}
+        # We do NOT (and cannot) obtain a real cert here: there are no Azure
+        # DNS credentials in CI. This proves the lego v5 CLI invocation parses
+        # and reaches the DNS-01 challenge / provider-setup step, which is
+        # exactly the class of bug (flag-ordering, hook env names, a bad
+        # provider name) that broke during dev.
+        #
+        # We exercise the REAL default provider (azuredns) so this test fails
+        # if the azuredns provider name or its wiring regresses. With no
+        # AZURE_* creds present, lego's azuredns provider fails to build its
+        # Azure credential — that error proves the CLI invocation is valid and
+        # reached provider setup.
+        #
+        # CRITICAL GUARDRAIL: LE_STAGING defaults to true and we assert the
+        # PRODUCTION ACME endpoint is NEVER contacted, so a PR can never burn
+        # Let's Encrypt production rate limits.
+        run: |
+          set -uo pipefail
+          # Run a few fast iterations against the STAGING CA with no provider
+          # creds; expect an azuredns credential/auth error, then stop.
+          docker run -d --name lego-smoke \
+            -e LORE_DOMAIN=lore.example.com \
+            -e LE_EMAIL=ci@example.com \
+            -e LE_DNS_PROVIDER=azuredns \
+            -e LE_STAGING=true \
+            -e RENEW_INTERVAL_SECONDS=2 \
+            "$IMAGE"
+
+          parsed_ok=0
+          for i in $(seq 1 20); do
+            logs="$(docker logs lego-smoke 2>&1 || true)"
+            # Success criterion: lego got past flag parsing into the ACME/DNS
+            # provider setup. With no AZURE_* creds it fails building the Azure
+            # credential (or the generic "credentials information are missing"
+            # path) — either string proves the CLI invocation is well-formed
+            # and the azuredns provider was selected.
+            if echo "$logs" | grep -qiE 'credentials information are missing|DNS challenge provider|azure|azuredns|DefaultAzureCredential|ManagedIdentityCredential|EnvironmentCredential'; then
+              echo "lego reached the azuredns provider setup step (CLI invocation is valid)"
+              parsed_ok=1
+              break
+            fi
+            # A flag-parsing regression shows up as this instead:
+            if echo "$logs" | grep -qiE 'flag provided but not defined|Incorrect Usage'; then
+              echo "::error::lego CLI invocation is malformed (flag parsing failed)"
+              break
+            fi
+            sleep 2
+          done
+
+          all_logs="$(docker logs lego-smoke 2>&1 || true)"
+          echo "::group::lego sidecar logs"
+          echo "$all_logs"
+          echo "::endgroup::"
+
+          # Hard guardrail: the production ACME directory must never appear.
+          if echo "$all_logs" | grep -q 'acme-v02.api.letsencrypt.org'; then
+            echo "::error::sidecar contacted PRODUCTION Let's Encrypt in CI — must be staging only"
+            docker rm -f lego-smoke >/dev/null 2>&1 || true
+            exit 1
+          fi
+          # Positive confirmation it used staging.
+          if ! echo "$all_logs" | grep -qi 'STAGING'; then
+            echo "::warning::did not observe the staging banner; check LE_STAGING default"
+          fi
+
+          docker rm -f lego-smoke >/dev/null 2>&1 || true
+
+          if [ "$parsed_ok" -ne 1 ]; then
+            echo "::error::lego sidecar never reached the DNS-01 step — CLI likely broken"
+            exit 1
+          fi

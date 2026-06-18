@@ -1,0 +1,13 @@
+#!/command/with-contenv sh
+# Launch loreserver under s6 supervision as the unprivileged `lore` user.
+#
+# s6 supervises this PID directly (we exec, so loreserver replaces the
+# shell). loreserver loads its layered config from LORE_CONFIG_PATH
+# (/etc/lore/config): the baked default.toml, the build-time docker.toml
+# pinning the stores to /data, and any operator-mounted local.toml
+# (certs, auth, tuning). LORE_ENV=docker selects the docker.toml layer.
+#
+# Drop privileges with s6-setuidgid: there's no reason for a
+# network-facing VCS server to keep root inside the container, and the
+# /data volume is owned by the lore user (UID/GID 1001).
+exec s6-setuidgid lore /usr/local/bin/loreserver

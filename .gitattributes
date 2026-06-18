@@ -1,0 +1,18 @@
+# These files run INSIDE the Linux container. CRLF line endings would
+# break the shebang (`/bin/sh^M: bad interpreter`) and s6's execline
+# parsing. Force LF regardless of the committer's platform (this repo is
+# authored on Windows). This is a correctness requirement, not a style one.
+*.sh            text eol=lf
+docker/entrypoint.sh        text eol=lf
+docker/s6/**    text eol=lf
+docker/Dockerfile           text eol=lf
+docker/Dockerfile.dockerignore text eol=lf
+docker/**/Dockerfile        text eol=lf
+docker/**/Dockerfile.dockerignore text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+.trivyignore    text eol=lf
+
+# Backups / certs are binary-ish; never normalize.
+*.tar.zst       binary
+*.pem           binary

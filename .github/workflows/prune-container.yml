@@ -1,0 +1,52 @@
+name: prune-container
+
+# Retention policy for the GHCR `lore-server` package, so old image tags
+# don't accumulate forever and fill the registry (and, by extension,
+# pressure the colo disk when it pulls). The colo box is finite hardware,
+# not elastic cloud — capacity discipline is deliberate here.
+#
+# Policy:
+#   - Keep the last 14 dated tags (`vYYYY-MM-DD.N` / image `YYYY-MM-DD.N`).
+#   - NEVER delete rolling pointers (`latest`, `latest-prerelease`,
+#     `stable`) or any explicit semver tag (`v1.2.3`) — a deployed colo
+#     could be pinned to one of those, and deleting it would make a
+#     redeploy or rollback impossible.
+#   - Clean up untagged orphan manifests left behind by tag deletions.
+#
+# Separate workflow (not a release step) so a prune error never blocks a
+# release, and so it runs on quiet weeks via the schedule.
+
+on:
+  schedule:
+    - cron: '0 6 * * 0'   # Sundays 06:00 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: prune-container
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    name: prune dated GHCR tags
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    timeout-minutes: 10
+    steps:
+      - name: prune dated tags (keep last 14, protect rolling/semver pointers)
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5
+        with:
+          package-name: lore-server
+          package-type: container
+          min-versions-to-keep: 14
+          ignore-versions: '^(latest|latest-prerelease|stable|v?\d+\.\d+\.\d+)$'
+
+      - name: prune untagged orphan manifests
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5
+        with:
+          package-name: lore-server
+          package-type: container
+          min-versions-to-keep: 0
+          delete-only-untagged-versions: true

@@ -1,0 +1,65 @@
+# Lore server operator overrides — LAN bind addresses + TLS certificate wiring.
+#
+# Copy to the colo as /opt/lore/config/local.toml and mount it read-only
+# into lore-server (see compose.yml). local.toml is the highest-priority
+# on-disk config layer (after it come only LORE__-prefixed env vars), so
+# these win over the image's baked default.toml / docker.toml.
+#
+# The cert/key paths point at what the lego sidecar writes onto the SHARED
+# `lore-certs` volume. lego's output filenames are <domain>.crt (leaf +
+# issuer chain) and <domain>.key. The lore-server container mounts that
+# volume read-only at /certs, so the files appear at:
+#
+#   /certs/certificates/<LORE_DOMAIN>.crt
+#   /certs/certificates/<LORE_DOMAIN>.key
+#
+# Replace <LORE_DOMAIN> below with the real domain (e.g.
+# lore.sandboxservers.games). These must match LORE_DOMAIN in .env.
+#
+# NOTE: Lore loads these at STARTUP ONLY (no hot-reload). After lego
+# renews, the sidecar's renew-hook restarts lore-server so it re-reads
+# them. See RUNBOOK § TLS.
+#
+# ===========================================================================
+# NETWORK BIND ADDRESS — VPN-only, never the public internet
+# ===========================================================================
+# Lore is reachable ONLY over the operators' existing UniFi (UCG Fiber)
+# WireGuard VPN. Lore ships with auth DISABLED (gRPC accepts unauthenticated
+# requests), so its ports MUST NOT answer on the public internet. Every
+# endpoint below is bound to the host's PRIVATE LAN interface IP, never
+# 0.0.0.0 (all interfaces) and never the WAN address.
+#
+# Each endpoint's bind address is the `host` field of its `[server.<ep>]`
+# table (confirmed against upstream docs/reference/lore-server-config.md:
+# `[server.quic]`, `[server.grpc]`, and `[server.http]` each take `host`
+# (default `0.0.0.0`) + `port`). We pin `host` to the LAN IP on all three.
+#
+# Replace <LORE_LAN_IP> below with the host's real private LAN IP (the same
+# value as LORE_LAN_IP in .env). On the box, the first-time-deploy `sed`
+# step substitutes both <LORE_DOMAIN> and <LORE_LAN_IP> for you — see
+# RUNBOOK § First-time deploy. Defense in depth: compose ALSO publishes the
+# host ports bound to this same IP, so a bad local.toml can't silently fall
+# back to all-interfaces.
+
+# Public QUIC endpoint (push/clone over UDP/41337) — bind to the LAN IP only.
+[server.quic]
+host = "<LORE_LAN_IP>"
+
+# gRPC control endpoint (HTTP/2 over TCP/41337) — bind to the LAN IP only.
+[server.grpc]
+host = "<LORE_LAN_IP>"
+
+# HTTP endpoint (health check + presigned URLs, TCP/41339) — LAN IP only.
+[server.http]
+host = "<LORE_LAN_IP>"
+
+# Public QUIC endpoint (push/clone over UDP/41337) — clients pin this cert.
+[server.quic.certificate]
+cert_file = "/certs/certificates/<LORE_DOMAIN>.crt"
+pkey_file = "/certs/certificates/<LORE_DOMAIN>.key"
+
+# gRPC endpoint (HTTP/2 over TCP/41337) — serve the same LE cert so the
+# gRPC control path is TLS too, not just QUIC.
+[server.grpc.certificate]
+cert_file = "/certs/certificates/<LORE_DOMAIN>.crt"
+pkey_file = "/certs/certificates/<LORE_DOMAIN>.key"

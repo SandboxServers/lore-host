@@ -1,0 +1,232 @@
+name: release-container
+
+# Build and publish the self-hosted Lore server container image. Releases
+# are GATED — this workflow does NOT run on push to main. Trigger paths:
+#
+#   1. Comment `/release` on a merged PR — release-on-comment.yml validates
+#      the commenter and dispatches this workflow.
+#   2. Run manually from the Actions UI or
+#      `gh workflow run release-container.yml --ref main`.
+#
+# Both build whatever is at `main` HEAD. The optional `triggering_pr`
+# input is audit metadata only.
+#
+# Published to:
+#   1. ghcr.io/<owner>/lore-server:<YYYY-MM-DD.N>   (immutable dated tag)
+#   2. ghcr.io/<owner>/lore-server:latest-prerelease (rolling pointer,
+#      promoted only AFTER smoke passes)
+#   3. A GitHub pre-release with pull instructions.
+#
+# NOTE on pinning: the colo MUST deploy an immutable dated tag, not the
+# rolling pointer — Lore is pre-1.0 and an unexpected image swap can mean
+# an on-disk-format mismatch against the live /data. `latest-prerelease`
+# exists for convenience/testing; production pins a dated tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      triggering_pr:
+        description: 'Optional PR number that prompted this release (audit-only)'
+        required: false
+        type: string
+
+permissions: {}
+
+# Serialise releases (don't cancel — a release that started must finish).
+concurrency:
+  group: release-container
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: build, push, release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # gh release create
+      packages: write       # push to ghcr.io
+      attestations: write   # buildx provenance + SBOM attestations
+      id-token: write       # OIDC token for keyless provenance signing
+    timeout-minutes: 60
+    steps:
+      # workflow_dispatch accepts an arbitrary --ref; refuse to publish
+      # from anywhere but main so a typo'd or malicious branch dispatch
+      # can't be tagged as a release.
+      - name: reject non-main dispatches
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::release-container must be dispatched from main; got ${{ github.ref }}"
+          exit 1
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: lowercase image owner
+        id: img
+        run: |
+          owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner_lc}/lore-server" >> "$GITHUB_OUTPUT"
+
+      - name: compute version (YYYY-MM-DD.N)
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ steps.img.outputs.image }}
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y-%m-%d)
+          CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          N=$(gh release list --limit 200 --json tagName \
+                --jq "[.[] | select(.tagName | startswith(\"v${DATE}.\"))] | length")
+          N=$((N + 1))
+          # Bump past any GHCR tag already at this version (a prior run that
+          # pushed but failed before `gh release create`). Tag is truth.
+          while docker manifest inspect "${IMAGE}:${DATE}.${N}" >/dev/null 2>&1; do
+              N=$((N + 1))
+          done
+
+          echo "version=${DATE}.${N}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${DATE}.${N}"    >> "$GITHUB_OUTPUT"
+          echo "created=${CREATED}"   >> "$GITHUB_OUTPUT"
+
+      # Two-pass build: load-for-scan (Trivy can't scan an unbuilt remote
+      # image, and `load: true` is incompatible with provenance/sbom),
+      # then push-with-attestations. The push pass hits the buildx cache,
+      # so it just attaches attestations + pushes — no recompile.
+      - name: build (load locally for scan)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: scan with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+          trivyignores: .trivyignore
+
+      # Push only the immutable dated tag now. The rolling pointer is
+      # promoted AFTER smoke passes, so a smoke failure can't leave it
+      # aimed at a broken image.
+      - name: push dated tag (with provenance + SBOM, after scan)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+            org.opencontainers.image.created=${{ steps.ver.outputs.created }}
+          cache-from: type=gha
+          provenance: true
+          sbom: true
+
+      - name: smoke-test the published image
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}
+        run: |
+          set -uo pipefail
+          docker pull "$IMAGE"
+          docker run -d --name smoke \
+            -p 41337:41337/tcp \
+            -p 41337:41337/udp \
+            -p 41339:41339/tcp \
+            "$IMAGE"
+          ok=0
+          for i in $(seq 1 60); do
+            if docker exec smoke curl --fail --silent http://127.0.0.1:41339/health_check >/dev/null 2>&1; then
+              echo "smoke ok at iteration $i"
+              ok=1
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Status}}' smoke 2>/dev/null)" = "exited" ]; then
+              echo "::error::container exited before becoming healthy"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "::group::container state"
+          docker inspect -f 'Status: {{.State.Status}}  ExitCode: {{.State.ExitCode}}  Error: {{.State.Error}}' smoke || true
+          echo "::endgroup::"
+          echo "::group::container logs"
+          docker logs smoke || true
+          echo "::endgroup::"
+
+          docker rm -f smoke >/dev/null 2>&1 || true
+
+          if [ "$ok" -ne 1 ]; then
+              echo "::error::smoke test never saw a healthy /health_check within 120s"
+              exit 1
+          fi
+
+      # Smoke passed — only now move the rolling pointer. The smoke step's
+      # `docker pull` already loaded the image locally, so this is a local
+      # retag + push (no rebuild).
+      - name: promote latest-prerelease
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker tag "${IMAGE}:${VERSION}" "${IMAGE}:latest-prerelease"
+          docker push "${IMAGE}:latest-prerelease"
+
+      - name: create GitHub pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ steps.img.outputs.image }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          TRIGGERING_PR: ${{ inputs.triggering_pr }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Self-hosted Lore VCS server image \`${VERSION}\`."
+            echo
+            echo "Built from Lore upstream tag pinned in \`docker/Dockerfile\` (\`LORE_VERSION\`)."
+            echo
+            echo "## Pull"
+            echo '```'
+            echo "docker pull ${IMAGE}:${VERSION}"
+            echo '```'
+            echo
+            echo "## Deploy on the colo"
+            echo "Pin this immutable dated tag in \`docker/compose.yml\` (NOT \`latest-prerelease\`),"
+            echo "**take a backup first** (Lore is pre-1.0), then follow docs/RUNBOOK.md § Upgrade."
+            if [ -n "${TRIGGERING_PR:-}" ]; then
+              echo
+              echo "_Triggered by #${TRIGGERING_PR}._"
+            fi
+          } > /tmp/release-notes.md
+
+          gh release create "${TAG}" \
+            --prerelease \
+            --title "Lore server ${VERSION}" \
+            --notes-file /tmp/release-notes.md \
+            --target "${{ github.sha }}"

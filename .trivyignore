@@ -1,0 +1,12 @@
+# Trivy CVE suppressions for the lore-server image.
+#
+# The container workflows (pr-container.yml, release-container.yml) scan
+# the built image and FAIL on CRITICAL CVEs. To accept a specific CVE
+# that is unreachable in our image (or for which no fix exists yet), add
+# its ID below WITH a one-line justification and a date. Do not blanket-
+# ignore — each entry is a deliberate, reviewed exception.
+#
+# Format:
+#   CVE-YYYY-NNNNN  # why it's accepted / unreachable — name, YYYY-MM-DD
+#
+# (none yet)
